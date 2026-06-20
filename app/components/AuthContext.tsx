@@ -3,7 +3,7 @@
 import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
 
-const API = 'http://localhost:8000';
+const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export interface AuthUser {
   id: string;
@@ -56,9 +56,13 @@ function mapUser(raw: Record<string, unknown>): AuthUser {
   };
 }
 
-async function apiFetch(path: string, opts?: RequestInit) {
+class OfflineError extends Error {
+  constructor() { super('server offline — use GitHub login or continue as guest'); this.name = 'OfflineError'; }
+}
+
+async function apiFetch(path: string, opts?: RequestInit, timeoutMs = 5000) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 4000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(`${API}${path}`, {
       credentials: 'include',
@@ -74,9 +78,14 @@ async function apiFetch(path: string, opts?: RequestInit) {
     return res.json();
   } catch (e) {
     clearTimeout(timer);
+    if (e instanceof Error && (e.name === 'AbortError' || e.message.includes('fetch') || e.message.includes('network') || e.message.includes('Failed to fetch'))) {
+      throw new OfflineError();
+    }
     throw e;
   }
 }
+
+export { OfflineError };
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);

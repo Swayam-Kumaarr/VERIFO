@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useAuth } from '../components/AuthContext';
+import { useAuth, OfflineError } from '../components/AuthContext';
 
 function GitHubIcon() {
   return (
@@ -39,6 +39,7 @@ export default function LoginPage() {
   const [githubLoading, setGithubLoading] = useState(false);
   const [guestLoading, setGuestLoading] = useState(false);
   const [error, setError] = useState('');
+  const [offline, setOffline] = useState(false);
 
   useEffect(() => {
     if (!loading && user) router.replace('/dashboard');
@@ -47,9 +48,13 @@ export default function LoginPage() {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!email || !password) { setError('both fields required'); return; }
-    setError(''); setSubmitting(true);
+    setError(''); setOffline(false); setSubmitting(true);
     try { await login(email, password); }
-    catch (err) { setError(err instanceof Error ? err.message : 'login failed'); setSubmitting(false); }
+    catch (err) {
+      if (err instanceof OfflineError) { setOffline(true); }
+      else { setError(err instanceof Error ? err.message : 'login failed'); }
+      setSubmitting(false);
+    }
   };
 
   const handleGitHub = () => {
@@ -133,6 +138,13 @@ export default function LoginPage() {
             <h1 className="text-xl font-bold text-white tracking-tight">Welcome back</h1>
             <p className="text-[#52525b] text-sm mt-1">Sign in to your account to continue.</p>
           </div>
+
+          {offline && (
+            <div className="flex flex-col gap-2 px-3 py-3 rounded-lg border border-[#f59e0b]/25 bg-[#f59e0b]/5 text-[#f59e0b] text-xs font-mono">
+              <div className="flex items-center gap-2"><span>⚠</span> <span className="font-semibold">backend offline</span></div>
+              <p className="text-[#a1a1aa] leading-relaxed">Email/password auth needs our server. Use <strong className="text-white">GitHub login</strong> or <strong className="text-white">continue as guest</strong> to access the demo.</p>
+            </div>
+          )}
 
           {/* GitHub button */}
           <button

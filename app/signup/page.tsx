@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useAuth } from '../components/AuthContext';
+import { useAuth, OfflineError } from '../components/AuthContext';
 
 function GitHubIcon() {
   return (
@@ -40,6 +40,7 @@ export default function SignupPage() {
   const [submitting, setSubmitting] = useState(false);
   const [githubLoading, setGithubLoading] = useState(false);
   const [error, setError] = useState('');
+  const [offline, setOffline] = useState(false);
 
   useEffect(() => {
     if (!loading && user) router.replace('/dashboard');
@@ -49,9 +50,13 @@ export default function SignupPage() {
     e.preventDefault();
     if (!name.trim() || !email || !password) { setError('all fields are required'); return; }
     if (password.length < 8) { setError('password must be at least 8 characters'); return; }
-    setError(''); setSubmitting(true);
+    setError(''); setOffline(false); setSubmitting(true);
     try { await signup(name.trim(), email, password, role); }
-    catch (err) { setError(err instanceof Error ? err.message : 'signup failed'); setSubmitting(false); }
+    catch (err) {
+      if (err instanceof OfflineError) { setOffline(true); }
+      else { setError(err instanceof Error ? err.message : 'signup failed'); }
+      setSubmitting(false);
+    }
   };
 
   const handleGitHub = () => {
@@ -127,6 +132,13 @@ export default function SignupPage() {
               ))}
             </div>
           </div>
+
+          {offline && (
+            <div className="flex flex-col gap-2 px-3 py-3 rounded-lg border border-[#f59e0b]/25 bg-[#f59e0b]/5 text-[#f59e0b] text-xs font-mono">
+              <div className="flex items-center gap-2"><span>⚠</span> <span className="font-semibold">backend offline</span></div>
+              <p className="text-[#a1a1aa] leading-relaxed">Account creation needs our server. Use <strong className="text-white">GitHub</strong> to sign up or <strong className="text-white">continue as guest</strong> to explore the demo.</p>
+            </div>
+          )}
 
           {/* GitHub */}
           <button
