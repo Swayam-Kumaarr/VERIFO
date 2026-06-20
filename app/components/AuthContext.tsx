@@ -57,16 +57,25 @@ function mapUser(raw: Record<string, unknown>): AuthUser {
 }
 
 async function apiFetch(path: string, opts?: RequestInit) {
-  const res = await fetch(`${API}${path}`, {
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    ...opts,
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail ?? `Request failed: ${res.status}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+  try {
+    const res = await fetch(`${API}${path}`, {
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      ...opts,
+    });
+    clearTimeout(timer);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail ?? `Request failed: ${res.status}`);
+    }
+    return res.json();
+  } catch (e) {
+    clearTimeout(timer);
+    throw e;
   }
-  return res.json();
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {

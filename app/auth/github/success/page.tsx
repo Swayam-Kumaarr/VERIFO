@@ -1,11 +1,9 @@
 'use client';
 
-import { useEffect } from 'react';
+import { Suspense, useEffect } from 'react';
 import { useSearchParams } from 'next/navigation';
 
-// This page lives inside the OAuth popup.
-// It sends the token back to the opener via postMessage, then closes itself.
-export default function GitHubSuccessPage() {
+function GitHubSuccessInner() {
   const params = useSearchParams();
 
   useEffect(() => {
@@ -22,7 +20,6 @@ export default function GitHubSuccessPage() {
       );
       window.close();
     } else {
-      // Fallback: not in a popup — redirect normally
       window.location.replace('/dashboard');
     }
   }, [params]);
@@ -32,5 +29,18 @@ export default function GitHubSuccessPage() {
       <div className="w-5 h-5 border-2 border-[#6c63ff]/30 border-t-[#6c63ff] rounded-full animate-spin" />
       <p className="font-mono text-xs text-[#52525b]">connecting...</p>
     </div>
+  );
+}
+
+export default function GitHubSuccessPage() {
+  return (
+    <Suspense fallback={
+      <div className="min-h-screen bg-[#0a0a0f] flex flex-col items-center justify-center gap-3">
+        <div className="w-5 h-5 border-2 border-[#6c63ff]/30 border-t-[#6c63ff] rounded-full animate-spin" />
+        <p className="font-mono text-xs text-[#52525b]">connecting...</p>
+      </div>
+    }>
+      <GitHubSuccessInner />
+    </Suspense>
   );
 }

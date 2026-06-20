@@ -1,10 +1,37 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '../components/AuthContext';
 import { useToast } from '../components/ToastContext';
 import Nav from '../components/Nav';
+
+const ENGINEERING_ROLES = [
+  'Front-End Engineer',
+  'Back-End Engineer',
+  'Full Stack Engineer',
+  'Software Engineer in Test (QA Engineer)',
+  'Software Development Engineer in Test (SDET)',
+  'DevOps Engineer',
+  'Security Engineer',
+  'Data Engineer',
+  'Cloud Architect',
+  'Systems Engineer',
+  'Mobile Engineer',
+  'Technical Support Engineer',
+  'Game Developer',
+  'Machine Learning (ML) Engineer',
+  'Artificial Intelligence (AI) Engineer',
+  'Blockchain Engineer',
+  'Embedded Systems Engineer',
+  'Web Application Security Engineer (WASE)',
+  'Site Reliability Engineer (SRE)',
+  'User Experience (UX) Engineer',
+  'User Interface (UI) Engineer',
+  'Robotics Engineer',
+  'Internet of Things (IoT) Engineer',
+  'Software Integration Engineer',
+];
 
 function GitHubIcon() {
   return (
@@ -21,7 +48,10 @@ export default function ProfilePage() {
 
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
+  const [jobRole, setJobRole] = useState('');
+  const [roleOpen, setRoleOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const roleRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!loading && !user) router.replace('/login');
@@ -31,8 +61,18 @@ export default function ProfilePage() {
     if (user) {
       setName(user.name);
       setEmail(user.email);
+      setJobRole((user as unknown as Record<string, string>).jobRole ?? '');
     }
   }, [user]);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (roleRef.current && !roleRef.current.contains(e.target as Node)) setRoleOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
 
   if (loading || !user) return (
     <div className="min-h-screen bg-[#0a0a0f] flex items-center justify-center">
@@ -50,7 +90,7 @@ export default function ProfilePage() {
         method: 'PATCH',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name.trim(), email: email.trim() }),
+        body: JSON.stringify({ name: name.trim(), email: email.trim(), job_role: jobRole }),
       });
       await refreshUser();
       showToast('Profile saved', 'success');
@@ -125,12 +165,34 @@ export default function ProfilePage() {
                   />
                 </div>
               </div>
-              <div className="flex flex-col gap-1.5">
-                <label className="text-[10px] font-mono text-[#52525b] uppercase tracking-wider">Role</label>
-                <div className="flex items-center gap-2 bg-[#0d0d14] border border-[#2a2a35] rounded-lg px-3 py-2.5">
-                  <span className={`text-sm font-mono ${user.role === 'client' ? 'text-[#f59e0b]' : 'text-[#a78bfa]'}`}>
-                    {user.role === 'client' ? '🏢 Client' : '👨‍💻 Developer'}
-                  </span>
+              <div className="flex flex-col gap-1.5" ref={roleRef}>
+                <label className="text-[10px] font-mono text-[#52525b] uppercase tracking-wider">Job Role</label>
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setRoleOpen(o => !o)}
+                    className="w-full flex items-center justify-between gap-2 bg-[#0d0d14] border border-[#2a2a35] rounded-lg px-3 py-2.5 text-left focus:outline-none focus:border-[#6c63ff]/60 transition-all hover:border-[#3a3a45]"
+                  >
+                    <span className={`text-sm font-mono truncate ${jobRole ? 'text-white' : 'text-[#3f3f46]'}`}>
+                      {jobRole || 'Select your role'}
+                    </span>
+                    <svg className={`w-3.5 h-3.5 text-[#52525b] flex-shrink-0 transition-transform ${roleOpen ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+                  {roleOpen && (
+                    <div className="absolute z-50 top-full mt-1 left-0 right-0 bg-[#111118] border border-[#2a2a35] rounded-lg shadow-xl overflow-y-auto" style={{ maxHeight: 220 }}>
+                      {ENGINEERING_ROLES.map(r => (
+                        <button
+                          key={r} type="button"
+                          onClick={() => { setJobRole(r); setRoleOpen(false); }}
+                          className={`w-full text-left px-3 py-2 text-xs font-mono transition-colors ${jobRole === r ? 'text-[#a78bfa] bg-[#6c63ff]/10' : 'text-[#71717a] hover:text-white hover:bg-[#ffffff]/4'}`}
+                        >
+                          {r}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
