@@ -121,8 +121,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const loginAsGuest = async () => {
-    const data = await apiFetch('/api/auth/guest', { method: 'POST' });
-    setUser(mapUser(data.user));
+    // No backend needed — just set a local guest user
+    const guest: AuthUser = {
+      id: 'guest',
+      name: 'Guest',
+      email: 'guest@nexora.local',
+      avatarInitial: 'G',
+      githubConnected: false,
+      role: 'developer',
+      joinedAt: new Date().toISOString(),
+      emailVerified: false,
+    };
+    setUser(guest);
     router.push('/dashboard');
   };
 

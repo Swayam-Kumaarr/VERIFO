@@ -173,10 +173,10 @@ export default function LandingPage() {
                 className="px-6 py-3 rounded-xl bg-[#6c63ff] text-white font-semibold text-sm hover:bg-[#7c73ff] hover:-translate-y-px hover:shadow-[0_8px_30px_rgba(108,99,255,0.3)] transition-all">
                 get your proof link →
               </Link>
-              <Link href="/u/swayam"
-                className="px-6 py-3 rounded-xl border border-[#2a2a35] text-[#71717a] text-sm font-mono hover:border-[#6c63ff]/30 hover:text-white transition-all">
-                see demo proof card
-              </Link>
+              <span className="px-6 py-3 rounded-xl border border-[#1e1e28] text-[#3f3f46] text-sm font-mono cursor-not-allowed flex items-center gap-2">
+                <span className="w-1.5 h-1.5 rounded-full bg-[#f59e0b] animate-pulse" />
+                proof cards — coming soon
+              </span>
             </div>
 
             <div className="flex items-center gap-6 text-[11px] font-mono text-[#3f3f46]">

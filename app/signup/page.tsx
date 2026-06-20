@@ -29,7 +29,7 @@ function EyeIcon({ off }: { off?: boolean }) {
 }
 
 export default function SignupPage() {
-  const { user, loading, signup, loginWithGitHub } = useAuth();
+  const { user, loading, signup, loginWithGitHub, loginAsGuest } = useAuth();
   const router = useRouter();
 
   const [name, setName] = useState('');
@@ -218,6 +218,19 @@ export default function SignupPage() {
               By signing up you agree to our terms of service.
             </p>
           </form>
+
+          <div className="flex items-center gap-3">
+            <div className="flex-1 h-px bg-[#1e1e28]" />
+            <span className="text-[10px] font-mono text-[#3f3f46]">or</span>
+            <div className="flex-1 h-px bg-[#1e1e28]" />
+          </div>
+
+          <button
+            onClick={loginAsGuest}
+            className="w-full py-2.5 rounded-lg border border-[#2a2a35] text-[#52525b] text-sm font-mono hover:text-white hover:border-[#6c63ff]/30 transition-all"
+          >
+            continue as guest →
+          </button>
 
           <p className="text-center text-xs text-[#3f3f46] font-mono">
             already have an account?{' '}
