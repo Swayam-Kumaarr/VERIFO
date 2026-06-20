@@ -1,150 +1,438 @@
 """
-Real analysis pipeline — GitHub API + Claude API.
-Runs as a FastAPI BackgroundTask.
+Agent loop pipeline — OpenRouter (OpenAI SDK) + GitHub API + live deployment checks.
+
+The agent receives the submission, then picks tools to investigate GitHub repos,
+verify deployments, and read misc links. It finishes by calling `finalize_resume`
+which produces the structured "real resume" payload that gets stored.
 """
 
 import asyncio
+import json
 import os
+import re
+import time
 import uuid
 from datetime import datetime, timezone
-from collections import defaultdict
+from urllib.parse import urlparse
 
 import httpx
-import anthropic
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
 
 from models import AnalysisRun, Result, Submission
 
-load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
+GITHUB_PAT = os.getenv("GITHUB_PAT", "")
+MODEL = "nex-agi/nex-n2-pro:free"
+MAX_ITERATIONS = 15
 GH_ACCEPT = "application/vnd.github+json"
 
-STEPS = [
-    "Connecting to GitHub API",
-    "Fetching repositories & commit history",
-    "Code pattern & AI signature analysis",
-    "Contributor & commit quality check",
-    "Generating honesty score (Claude)",
+
+# ── Tool definitions ──────────────────────────────────────────────────────────
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_repos",
+            "description": "List GitHub repos owned by a username. Returns name, description, primary language, stars, updated_at, html_url for up to 30 repos.",
+            "parameters": {
+                "type": "object",
+                "properties": {"username": {"type": "string"}},
+                "required": ["username"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_repo",
+            "description": "Get full details for one repo: languages breakdown, README content, topics, default branch.",
+            "parameters": {
+                "type": "object",
+                "properties": {"owner": {"type": "string"}, "repo": {"type": "string"}},
+                "required": ["owner", "repo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_commits",
+            "description": "List recent commits authored by `author` in a repo (up to 30). Use to verify the user actually wrote the code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "author": {"type": "string", "description": "GitHub username to filter by"},
+                },
+                "required": ["owner", "repo", "author"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_file_tree",
+            "description": "List top-level files and folders for a repo to understand its structure.",
+            "parameters": {
+                "type": "object",
+                "properties": {"owner": {"type": "string"}, "repo": {"type": "string"}},
+                "required": ["owner", "repo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read up to 8KB of a file in a repo. Useful for README, package.json, requirements.txt, etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+                "required": ["owner", "repo", "path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_deployment",
+            "description": "Verify a deployment URL is live. Returns status_code, response_ms, title, and a content snippet.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Fetch text content from any URL (portfolio sites, blogs, misc links). Strips HTML to plain text.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finalize_resume",
+            "description": "Output the final verified resume. Call this EXACTLY ONCE when you have gathered enough evidence. Every skill must cite real evidence.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "headline": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "skills": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "evidence": {"type": "string"},
+                            },
+                            "required": ["name", "evidence"],
+                        },
+                    },
+                    "projects": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "repo_url": {"type": "string"},
+                                "deploy_url": {"type": "string"},
+                                "stack": {"type": "array", "items": {"type": "string"}},
+                                "blurb": {"type": "string"},
+                                "verified": {"type": "boolean"},
+                            },
+                            "required": ["name", "stack", "blurb", "verified"],
+                        },
+                    },
+                    "links_verified": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string"},
+                                "kind": {"type": "string"},
+                                "live": {"type": "boolean"},
+                                "note": {"type": "string"},
+                            },
+                            "required": ["url", "kind", "live"],
+                        },
+                    },
+                    "red_flags": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["headline", "summary", "skills", "projects"],
+            },
+        },
+    },
 ]
 
 
-# ── GitHub helpers ─────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are Proof-of-Build, an agent that builds a verified "real resume" for a developer.
 
-def _gh_headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}", "Accept": GH_ACCEPT}
+You are given the user's self-reported info: name, age, optional resume text, GitHub URL, deployment URLs, and misc links.
 
-
-async def _gh_get(client: httpx.AsyncClient, url: str, token: str) -> dict | list:
-    r = await client.get(url, headers=_gh_headers(token), timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-
-async def fetch_repos(client: httpx.AsyncClient, token: str) -> list[dict]:
-    repos = await _gh_get(client, "https://api.github.com/user/repos?per_page=100&sort=updated&type=owner", token)
-    return repos if isinstance(repos, list) else []
-
-
-async def fetch_commits(client: httpx.AsyncClient, token: str, owner: str, repo: str) -> list[dict]:
-    try:
-        commits = await _gh_get(
-            client,
-            f"https://api.github.com/repos/{owner}/{repo}/commits?per_page=100&author={owner}",
-            token,
-        )
-        return commits if isinstance(commits, list) else []
-    except Exception:
-        return []
-
-
-async def fetch_languages(client: httpx.AsyncClient, token: str, owner: str, repo: str) -> dict:
-    try:
-        return await _gh_get(client, f"https://api.github.com/repos/{owner}/{repo}/languages", token)  # type: ignore
-    except Exception:
-        return {}
-
-
-# ── Analysis helpers ───────────────────────────────────────────────────────────
-
-AI_BOT_PATTERNS = ["github-copilot", "copilot", "cursor", "devin", "dependabot", "renovate", "github-actions"]
-GENERIC_MSG_WORDS = {"fix", "update", "change", "misc", "wip", "test", "edit", "stuff", "done", "refactor", "clean"}
-
-def _is_ai_commit(msg: str, co_authors: str) -> bool:
-    msg_lower = msg.lower().strip()
-    for bot in AI_BOT_PATTERNS:
-        if bot in co_authors.lower():
-            return True
-    # Very short single-word generic messages
-    words = msg_lower.split()
-    if len(words) <= 2 and all(w in GENERIC_MSG_WORDS for w in words):
-        return True
-    return False
-
-def _commit_quality(msg: str) -> str:
-    words = msg.strip().split()
-    if len(words) >= 8:
-        return "high"
-    if len(words) >= 4:
-        return "medium"
-    return "low"
-
-AI_FILE_PATTERNS = ["utils2", "helper_v", "helpers2", "index2", "temp_", "new_file", "untitled"]
-
-def _ai_filename_score(filenames: list[str]) -> int:
-    return sum(1 for f in filenames if any(p in f.lower() for p in AI_FILE_PATTERNS))
-
-
-# ── Claude analysis ────────────────────────────────────────────────────────────
-
-async def _claude_honesty_score(username: str, repo_summary: list[dict], ai_commit_count: int, total_commits: int) -> dict:
-    if not ANTHROPIC_KEY:
-        return {"score": 75, "label": "Mostly Honest", "summary": "Claude API key not configured — using estimated score."}
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-
-    repo_text = "\n".join(
-        f"- {r['name']}: {r['commits']} commits, {r['ai_commits']} AI-flagged, languages: {', '.join(r['langs'])}"
-        for r in repo_summary
-    )
-
-    prompt = f"""You are a developer authenticity analyzer. Given the following GitHub data for user "{username}", compute a developer honesty score from 0–100.
-
-Repository data:
-{repo_text}
-
-Total commits analyzed: {total_commits}
-AI-assisted commits detected: {ai_commit_count}
+Your job:
+1. Investigate the GitHub account — list repos, pick the most substantive ones, check commit authorship, read READMEs to understand what was built.
+2. Verify every deployment URL is actually live with `check_deployment`.
+3. Optionally fetch misc links for extra context.
+4. Build a structured resume where EVERY skill and EVERY project is grounded in concrete evidence you observed.
+5. Flag anything suspicious (dead deployments, claimed skills with no code, etc).
+6. Call `finalize_resume` exactly once to finish.
 
 Rules:
-- 90–100: No AI signatures, consistent commits, deep diffs
-- 75–89: Mostly genuine, minor AI usage
-- 60–74: Partial AI use, some generic patterns
-- Below 60: Heavy AI assistance or suspicious patterns
+- Don't invent skills the code doesn't show.
+- Use tool calls efficiently — you have a budget. Cap GitHub investigation at the top 5 most relevant repos.
+- A repo is "verified" only if commits exist authored by the user. A project is "verified" only if both repo + deployment check out.
+- Keep summary 2-3 sentences. Headline one line."""
 
-Respond ONLY as valid JSON with these exact keys:
-{{"score": <int 0-100>, "label": "<short label>", "summary": "<2-3 sentence plain English summary>"}}"""
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+def _gh_headers() -> dict:
+    h = {"Accept": GH_ACCEPT}
+    if GITHUB_PAT:
+        h["Authorization"] = f"Bearer {GITHUB_PAT}"
+    return h
+
+
+def _strip_html(text: str) -> str:
+    text = re.sub(r"<script[\s\S]*?</script>", " ", text, flags=re.I)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _title_of(html: str) -> str:
+    m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+    return m.group(1).strip() if m else ""
+
+
+# ── Tool implementations ──────────────────────────────────────────────────────
+
+async def _list_repos(client: httpx.AsyncClient, username: str) -> dict:
+    r = await client.get(
+        f"https://api.github.com/users/{username}/repos?per_page=30&sort=updated&type=owner",
+        headers=_gh_headers(),
+        timeout=15,
+    )
+    if r.status_code != 200:
+        return {"error": f"GitHub returned {r.status_code}: {r.text[:200]}"}
+    repos = r.json() or []
+    return {
+        "count": len(repos),
+        "repos": [
+            {
+                "name": x.get("name"),
+                "description": x.get("description"),
+                "language": x.get("language"),
+                "stars": x.get("stargazers_count"),
+                "updated_at": x.get("updated_at"),
+                "html_url": x.get("html_url"),
+                "fork": x.get("fork"),
+            }
+            for x in repos
+        ],
+    }
+
+
+async def _get_repo(client: httpx.AsyncClient, owner: str, repo: str) -> dict:
+    out: dict = {}
+    r = await client.get(f"https://api.github.com/repos/{owner}/{repo}", headers=_gh_headers(), timeout=15)
+    if r.status_code != 200:
+        return {"error": f"repo fetch {r.status_code}"}
+    data = r.json()
+    out["description"] = data.get("description")
+    out["topics"] = data.get("topics", [])
+    out["default_branch"] = data.get("default_branch")
+    out["html_url"] = data.get("html_url")
+    out["homepage"] = data.get("homepage")
+
+    rl = await client.get(f"https://api.github.com/repos/{owner}/{repo}/languages", headers=_gh_headers(), timeout=15)
+    out["languages"] = rl.json() if rl.status_code == 200 else {}
 
     try:
-        msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        import json
-        text = msg.content[0].text.strip()
-        # Extract JSON if wrapped in code fences
-        if "```" in text:
-            text = text.split("```")[1].lstrip("json").strip()
-        return json.loads(text)
+        rr = await client.get(f"https://api.github.com/repos/{owner}/{repo}/readme",
+                              headers={**_gh_headers(), "Accept": "application/vnd.github.raw"}, timeout=15)
+        out["readme"] = rr.text[:4000] if rr.status_code == 200 else ""
+    except Exception:
+        out["readme"] = ""
+    return out
+
+
+async def _list_commits(client: httpx.AsyncClient, owner: str, repo: str, author: str) -> dict:
+    r = await client.get(
+        f"https://api.github.com/repos/{owner}/{repo}/commits?per_page=30&author={author}",
+        headers=_gh_headers(),
+        timeout=15,
+    )
+    if r.status_code != 200:
+        return {"error": f"commits {r.status_code}", "by_user": 0}
+    commits = r.json() or []
+    return {
+        "by_user": len(commits),
+        "recent_messages": [c.get("commit", {}).get("message", "").splitlines()[0][:120] for c in commits[:10]],
+        "first_date": (commits[-1].get("commit", {}).get("author", {}).get("date") if commits else None),
+        "last_date": (commits[0].get("commit", {}).get("author", {}).get("date") if commits else None),
+    }
+
+
+async def _get_file_tree(client: httpx.AsyncClient, owner: str, repo: str) -> dict:
+    r = await client.get(f"https://api.github.com/repos/{owner}/{repo}", headers=_gh_headers(), timeout=15)
+    if r.status_code != 200:
+        return {"error": f"repo {r.status_code}"}
+    branch = r.json().get("default_branch", "main")
+    rt = await client.get(
+        f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}",
+        headers=_gh_headers(), timeout=15,
+    )
+    if rt.status_code != 200:
+        return {"error": f"tree {rt.status_code}"}
+    tree = rt.json().get("tree", [])
+    return {"entries": [{"path": x["path"], "type": x["type"]} for x in tree[:80]]}
+
+
+async def _read_file(client: httpx.AsyncClient, owner: str, repo: str, path: str) -> dict:
+    r = await client.get(
+        f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
+        headers={**_gh_headers(), "Accept": "application/vnd.github.raw"},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        return {"error": f"file {r.status_code}"}
+    return {"path": path, "content": r.text[:8000]}
+
+
+async def _check_deployment(client: httpx.AsyncClient, url: str) -> dict:
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    t0 = time.perf_counter()
+    try:
+        r = await client.get(url, timeout=12, follow_redirects=True, headers={"User-Agent": "ProofOfBuild/1.0"})
+        ms = int((time.perf_counter() - t0) * 1000)
+        body = r.text or ""
+        return {
+            "url": url,
+            "status_code": r.status_code,
+            "response_ms": ms,
+            "live": 200 <= r.status_code < 400,
+            "title": _title_of(body),
+            "snippet": _strip_html(body)[:400],
+            "final_url": str(r.url),
+        }
     except Exception as e:
-        return {"score": 72, "label": "Mostly Honest", "summary": f"Analysis completed with estimated score. ({e})"}
+        return {"url": url, "live": False, "error": str(e)[:200]}
 
 
-# ── Main pipeline ──────────────────────────────────────────────────────────────
+async def _fetch_url(client: httpx.AsyncClient, url: str) -> dict:
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        r = await client.get(url, timeout=12, follow_redirects=True, headers={"User-Agent": "ProofOfBuild/1.0"})
+        return {
+            "url": url,
+            "status_code": r.status_code,
+            "title": _title_of(r.text or ""),
+            "text": _strip_html(r.text or "")[:3000],
+        }
+    except Exception as e:
+        return {"url": url, "error": str(e)[:200]}
 
-async def run_pipeline(submission_id: str, run_id: str, db_factory, github_token: str | None = None):
+
+async def _dispatch(name: str, args: dict, http: httpx.AsyncClient) -> dict:
+    try:
+        if name == "list_repos":
+            return await _list_repos(http, args["username"])
+        if name == "get_repo":
+            return await _get_repo(http, args["owner"], args["repo"])
+        if name == "list_commits":
+            return await _list_commits(http, args["owner"], args["repo"], args["author"])
+        if name == "get_file_tree":
+            return await _get_file_tree(http, args["owner"], args["repo"])
+        if name == "read_file":
+            return await _read_file(http, args["owner"], args["repo"], args["path"])
+        if name == "check_deployment":
+            return await _check_deployment(http, args["url"])
+        if name == "fetch_url":
+            return await _fetch_url(http, args["url"])
+        return {"error": f"unknown tool: {name}"}
+    except KeyError as e:
+        return {"error": f"missing argument: {e}"}
+    except Exception as e:
+        return {"error": str(e)[:300]}
+
+
+def _summarize_call(name: str, args: dict) -> str:
+    if name == "list_repos": return f"→ Listing repos for @{args.get('username','?')}"
+    if name == "get_repo": return f"→ Inspecting {args.get('owner','?')}/{args.get('repo','?')}"
+    if name == "list_commits": return f"→ Checking commits by @{args.get('author','?')} in {args.get('repo','?')}"
+    if name == "get_file_tree": return f"→ Reading file tree of {args.get('repo','?')}"
+    if name == "read_file": return f"→ Reading {args.get('path','?')} in {args.get('repo','?')}"
+    if name == "check_deployment": return f"→ Probing deployment {args.get('url','?')}"
+    if name == "fetch_url": return f"→ Fetching {args.get('url','?')}"
+    if name == "finalize_resume": return "→ Composing verified resume"
+    return f"→ {name}"
+
+
+def _summarize_result(name: str, result: dict) -> str:
+    if "error" in result:
+        return f"  ⚠ {result['error']}"
+    if name == "list_repos":
+        return f"  ✓ {result.get('count', 0)} repos"
+    if name == "get_repo":
+        langs = ", ".join(list(result.get("languages", {}).keys())[:4]) or "—"
+        return f"  ✓ langs: {langs}"
+    if name == "list_commits":
+        return f"  ✓ {result.get('by_user', 0)} commits by user"
+    if name == "get_file_tree":
+        return f"  ✓ {len(result.get('entries', []))} entries"
+    if name == "read_file":
+        return f"  ✓ read {len(result.get('content', ''))} chars"
+    if name == "check_deployment":
+        if result.get("live"):
+            return f"  ✓ live · {result.get('status_code')} · {result.get('response_ms')}ms"
+        return f"  ✗ offline ({result.get('status_code', 'n/a')})"
+    if name == "fetch_url":
+        return f"  ✓ {result.get('status_code', '?')} · {len(result.get('text',''))} chars"
+    return "  ✓ ok"
+
+
+# ── GitHub username extraction ────────────────────────────────────────────────
+
+def _gh_username(submission: Submission) -> str | None:
+    url = (submission.github_url or "").strip()
+    if not url:
+        return None
+    if "/" not in url and "." not in url:
+        return url
+    try:
+        p = urlparse(url if "://" in url else "https://" + url)
+        parts = [x for x in p.path.split("/") if x]
+        return parts[0] if parts else None
+    except Exception:
+        return None
+
+
+# ── Main agent loop ───────────────────────────────────────────────────────────
+
+async def run_pipeline(submission_id: str, run_id: str, db_factory, **_):
     db: Session = db_factory()
     try:
         run = db.query(AnalysisRun).filter(AnalysisRun.id == run_id).first()
@@ -152,190 +440,134 @@ async def run_pipeline(submission_id: str, run_id: str, db_factory, github_token
         if not run or not submission:
             return
 
-        token = github_token or os.getenv("GITHUB_FALLBACK_TOKEN", "")
+        logs: list[str] = []
+
+        def log(line: str, label: str | None = None):
+            logs.append(line)
+            run.step_logs = logs
+            if label is not None:
+                run.step_label = label
+            db.commit()
 
         run.status = "running"
         run.started_at = datetime.now(timezone.utc)
+        run.step_label = "Booting agent"
         db.commit()
 
-        logs: dict[str, list[str]] = {}
+        log("→ Agent starting", "Booting agent")
+        log(f"→ Model: {MODEL}")
 
-        async with httpx.AsyncClient() as client:
+        if not OPENROUTER_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY missing in .env")
 
-            # ── Step 1: Connect ────────────────────────────────────────────────
-            run.current_step = 1
-            run.step_label = STEPS[0]
-            db.commit()
+        # Pre-compute GitHub username hint for the agent
+        gh_user = _gh_username(submission)
+        submission_blob = {
+            "name": submission.name,
+            "age": submission.age,
+            "email": submission.email,
+            "resume_text": submission.resume_text,
+            "github_url": submission.github_url,
+            "github_username_hint": gh_user,
+            "deployment_urls": submission.deployment_urls,
+            "misc_links": submission.misc_links,
+            "misc_notes": submission.misc_notes,
+        }
 
-            logs["1"] = []
-            _log(run, db, logs, "1", "→ Validating GitHub OAuth token...")
-            await asyncio.sleep(0.3)
+        oai = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_KEY,
+        )
 
-            try:
-                user_data = await _gh_get(client, "https://api.github.com/user", token)
-                username = user_data.get("login", "user")
-                rate = await _gh_get(client, "https://api.github.com/rate_limit", token)
-                remaining = rate.get("rate", {}).get("remaining", "?")
-                _log(run, db, logs, "1", f"→ Authenticated as: {username}")
-                _log(run, db, logs, "1", f"→ Rate limit: {remaining} / 5,000 remaining")
-                _log(run, db, logs, "1", "✓ GitHub connected")
-            except Exception as e:
-                _log(run, db, logs, "1", f"✗ Auth failed: {e}")
-                username = "user"
+        messages: list[dict] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "Here is the candidate's submission:\n\n" + json.dumps(submission_blob, indent=2)},
+        ]
 
-            await asyncio.sleep(0.3)
+        final_payload: dict | None = None
 
-            # ── Step 2: Fetch repos & commits ──────────────────────────────────
-            run.current_step = 2
-            run.step_label = STEPS[1]
-            db.commit()
+        async with httpx.AsyncClient() as http:
+            for it in range(MAX_ITERATIONS):
+                run.current_step = it + 1
+                run.step_label = f"Thinking (iter {it + 1})"
+                db.commit()
+                log(f"→ [iter {it + 1}] thinking…", f"Thinking (iter {it + 1})")
 
-            logs["2"] = []
-            _log(run, db, logs, "2", f"→ Fetching repositories for {username}...")
-            await asyncio.sleep(0.2)
+                resp = await oai.chat.completions.create(
+                    model=MODEL,
+                    messages=messages,
+                    tools=TOOLS,
+                    temperature=0.3,
+                )
+                msg = resp.choices[0].message
+                tool_calls = msg.tool_calls or []
 
-            repos = await fetch_repos(client, token)
-            _log(run, db, logs, "2", f"→ Found {len(repos)} owned repositories")
+                # Persist assistant message back into context
+                assistant_entry: dict = {"role": "assistant", "content": msg.content or ""}
+                if tool_calls:
+                    assistant_entry["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        }
+                        for tc in tool_calls
+                    ]
+                messages.append(assistant_entry)
 
-            all_commits = []
-            lang_totals: dict[str, int] = defaultdict(int)
-            repo_details = []
+                if not tool_calls:
+                    if msg.content:
+                        log(f"  agent: {msg.content[:200]}")
+                    log("⚠ Agent produced no tool calls — stopping")
+                    break
 
-            for repo in repos[:10]:  # cap at 10 repos to avoid rate limit
-                rname = repo["name"]
-                _log(run, db, logs, "2", f"→ Scanning {rname}...")
-                commits = await fetch_commits(client, token, username, rname)
-                langs = await fetch_languages(client, token, username, rname)
-                for lang, bytes_ in langs.items():
-                    lang_totals[lang] += bytes_
-                all_commits.extend(commits)
-                repo_details.append({"name": rname, "commits_raw": commits, "langs": list(langs.keys())})
-                await asyncio.sleep(0.1)
-
-            top_langs = sorted(lang_totals.items(), key=lambda x: x[1], reverse=True)[:5]
-            lang_str = ", ".join(f"{l}" for l, _ in top_langs)
-            _log(run, db, logs, "2", f"→ Top languages: {lang_str or 'none detected'}")
-            _log(run, db, logs, "2", f"✓ {len(all_commits)} commits indexed across {len(repos)} repos")
-
-            # ── Step 3: Code pattern analysis ─────────────────────────────────
-            run.current_step = 3
-            run.step_label = STEPS[2]
-            db.commit()
-
-            logs["3"] = []
-            _log(run, db, logs, "3", "→ Scanning commit messages for AI patterns...")
-            await asyncio.sleep(0.3)
-
-            ai_commits = 0
-            high_quality = 0
-            for commit in all_commits:
-                msg = commit.get("commit", {}).get("message", "")
-                co_authors = str(commit.get("commit", {}).get("message", ""))
-                if _is_ai_commit(msg, co_authors):
-                    ai_commits += 1
-                if _commit_quality(msg) == "high":
-                    high_quality += 1
-
-            total = len(all_commits)
-            ai_pct = round((ai_commits / total * 100) if total else 0)
-
-            _log(run, db, logs, "3", f"→ {ai_commits} AI-flagged commits out of {total} ({ai_pct}%)")
-
-            if ai_commits > 0:
-                _log(run, db, logs, "3", f"⚠ Found {ai_commits} commits with AI assistant signatures")
-            else:
-                _log(run, db, logs, "3", "→ No AI co-author signatures detected")
-
-            _log(run, db, logs, "3", f"→ High-quality commit messages: {high_quality}/{total}")
-            _log(run, db, logs, "3", "✓ Code pattern analysis complete")
-
-            # ── Step 4: Contributor quality check ─────────────────────────────
-            run.current_step = 4
-            run.step_label = STEPS[3]
-            db.commit()
-
-            logs["4"] = []
-            _log(run, db, logs, "4", "→ Checking commit time distribution...")
-            await asyncio.sleep(0.4)
-
-            # Commit time analysis
-            hours: dict[int, int] = defaultdict(int)
-            for commit in all_commits:
-                date_str = commit.get("commit", {}).get("author", {}).get("date", "")
-                if date_str:
+                stop_loop = False
+                for tc in tool_calls:
+                    name = tc.function.name
                     try:
-                        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                        hours[dt.hour] += 1
-                    except Exception:
-                        pass
+                        args = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
 
-            night_commits = sum(v for h, v in hours.items() if 0 <= h < 6)
-            if night_commits > total * 0.4 and total > 5:
-                _log(run, db, logs, "4", f"⚠ {night_commits} commits between midnight–6am — unusual pattern")
+                    log(_summarize_call(name, args), label=name)
+
+                    if name == "finalize_resume":
+                        final_payload = args
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": json.dumps({"ok": True}),
+                        })
+                        log("  ✓ resume finalized")
+                        stop_loop = True
+                        continue
+
+                    result = await _dispatch(name, args, http)
+                    log(_summarize_result(name, result))
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps(result)[:8000],
+                    })
+
+                if stop_loop:
+                    break
             else:
-                _log(run, db, logs, "4", "→ Commit time distribution looks natural")
+                log("⚠ Hit max iterations without finalize_resume")
 
-            # Burst detection — >20 commits same day
-            date_counts: dict[str, int] = defaultdict(int)
-            for commit in all_commits:
-                date_str = commit.get("commit", {}).get("author", {}).get("date", "")[:10]
-                if date_str:
-                    date_counts[date_str] += 1
-            burst_days = [d for d, c in date_counts.items() if c > 20]
-            if burst_days:
-                _log(run, db, logs, "4", f"⚠ Commit burst detected on {len(burst_days)} day(s) (>20 commits/day)")
-            else:
-                _log(run, db, logs, "4", "→ No commit burst patterns detected")
+        if not final_payload:
+            raise RuntimeError("Agent did not produce a finalized resume")
 
-            _log(run, db, logs, "4", "✓ Contributor check complete")
-
-            # ── Step 5: Claude honesty score ───────────────────────────────────
-            run.current_step = 5
-            run.step_label = STEPS[4]
-            db.commit()
-
-            logs["5"] = []
-            _log(run, db, logs, "5", "→ Sending verified data to Claude API...")
-            await asyncio.sleep(0.2)
-
-            repo_summary = [
-                {
-                    "name": r["name"],
-                    "commits": len(r["commits_raw"]),
-                    "ai_commits": sum(1 for c in r["commits_raw"] if _is_ai_commit(
-                        c.get("commit", {}).get("message", ""),
-                        c.get("commit", {}).get("message", ""),
-                    )),
-                    "langs": r["langs"][:3],
-                }
-                for r in repo_details
-            ]
-
-            claude_result = await _claude_honesty_score(username, repo_summary, ai_commits, total)
-
-            _log(run, db, logs, "5", f"→ Score computed: {claude_result['score']}/100")
-            _log(run, db, logs, "5", f"→ Label: {claude_result['label']}")
-            _log(run, db, logs, "5", "✓ Proof ledger ready")
-
-        # ── Build and store result ─────────────────────────────────────────────
+        # Enrich payload with submission metadata
+        verified_at = datetime.now(timezone.utc).isoformat()
         payload = {
-            "user": username,
-            "verified_at": datetime.now(timezone.utc).isoformat(),
-            "authenticity_score": claude_result["score"],
-            "authenticity_label": claude_result["label"],
-            "authenticity_summary": claude_result["summary"],
-            "repos_analyzed": len(repos),
-            "total_commits": total,
-            "ai_flagged_commits": ai_commits,
-            "top_languages": [l for l, _ in top_langs],
-            "high_quality_commits": high_quality,
-            "burst_days": burst_days,
-            "flags": {
-                "ai_signatures_detected": ai_commits > 0,
-                "commit_burst_detected": len(burst_days) > 0,
-                "unusual_night_commits": night_commits > total * 0.4 and total > 5,
-                "consistent_cadence": len(burst_days) == 0,
-            },
+            "name": submission.name,
+            "age": submission.age,
+            "email": submission.email,
+            "github_url": submission.github_url,
+            "github_username": gh_user,
+            "verified_at": verified_at,
+            **final_payload,
         }
 
         result = Result(
@@ -347,8 +579,9 @@ async def run_pipeline(submission_id: str, run_id: str, db_factory, github_token
         db.add(result)
 
         run.status = "done"
-        run.current_step = 5
+        run.step_label = "Done"
         run.finished_at = datetime.now(timezone.utc)
+        log("✓ Done", "Done")
         db.commit()
 
     except Exception as exc:
@@ -356,15 +589,15 @@ async def run_pipeline(submission_id: str, run_id: str, db_factory, github_token
         run = db.query(AnalysisRun).filter(AnalysisRun.id == run_id).first()
         if run:
             run.status = "failed"
-            run.error = str(exc)
+            run.error = str(exc)[:500]
             run.finished_at = datetime.now(timezone.utc)
+            try:
+                logs = run.step_logs
+                logs.append(f"✗ {exc}")
+                run.step_logs = logs
+            except Exception:
+                pass
             db.commit()
         raise
     finally:
         db.close()
-
-
-def _log(run: AnalysisRun, db: Session, logs: dict, step: str, line: str):
-    logs[step].append(line)
-    run.step_logs = logs
-    db.commit()

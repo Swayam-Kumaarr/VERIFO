@@ -59,42 +59,68 @@ def download_pdf(submission_id: str, db: Session = Depends(get_db)):
 
         styles = getSampleStyleSheet()
         purple = colors.HexColor("#6c63ff")
-        green = colors.HexColor("#22c55e")
 
-        title_style = ParagraphStyle("title", parent=styles["Heading1"], textColor=purple, fontSize=20, spaceAfter=4)
+        title_style = ParagraphStyle("title", parent=styles["Heading1"], textColor=purple, fontSize=22, spaceAfter=2)
+        headline_style = ParagraphStyle("headline", parent=styles["Normal"], fontSize=11, textColor=colors.HexColor("#374151"), spaceAfter=4)
         sub_style = ParagraphStyle("sub", parent=styles["Normal"], textColor=colors.grey, fontSize=9, spaceAfter=12)
         section_style = ParagraphStyle("section", parent=styles["Heading2"], textColor=purple, fontSize=12, spaceBefore=14, spaceAfter=6)
         body_style = ParagraphStyle("body", parent=styles["Normal"], fontSize=9, leading=14)
+        small_style = ParagraphStyle("small", parent=styles["Normal"], fontSize=8, textColor=colors.grey, leading=11)
+
+        name = payload.get("name") or payload.get("github_username") or "Unknown"
+        verified_when = payload.get("verified_at", datetime.utcnow().isoformat())[:10]
+        meta_bits = [b for b in [payload.get("email"), payload.get("github_url")] if b]
 
         story = [
-            Paragraph(f"Proof of Build — Verified Resume", title_style),
-            Paragraph(f"{payload.get('name', payload.get('user', 'Unknown'))} · {payload.get('email', '')} · verified {datetime.utcnow().strftime('%Y-%m-%d')}", sub_style),
-            Paragraph(f"Authenticity Score: {payload.get('authenticity_score', 0)}/100", body_style),
-            Spacer(1, 0.3*cm),
+            Paragraph(name, title_style),
+            Paragraph(payload.get("headline", ""), headline_style),
+            Paragraph(" · ".join(meta_bits + [f"verified {verified_when}"]), sub_style),
         ]
 
-        if payload.get("resume_summary"):
-            story += [Paragraph("Summary", section_style), Paragraph(payload["resume_summary"], body_style), Spacer(1, 0.2*cm)]
+        if payload.get("summary"):
+            story += [Paragraph("Summary", section_style), Paragraph(payload["summary"], body_style)]
 
-        if payload.get("projects"):
+        skills = payload.get("skills") or []
+        if skills:
+            story.append(Paragraph("Verified Skills", section_style))
+            for s in skills:
+                story.append(Paragraph(f"<b>{s.get('name','')}</b> — {s.get('evidence','')}", body_style))
+
+        projects = payload.get("projects") or []
+        if projects:
             story.append(Paragraph("Verified Projects", section_style))
-            for p in payload["projects"]:
-                deploy = p.get("deployment", {})
-                status = f"{'Live' if deploy.get('live') else 'Offline'} · {deploy.get('response_ms', '—')}ms"
-                story.append(Paragraph(f"<b>{p['name']}</b> — {status}", body_style))
-                story.append(Paragraph(f"Commits: {p.get('commits_yours')} · Contribution: {p.get('contribution_pct')}% · Lines added: +{p.get('lines_added')}", body_style))
+            for p in projects:
+                badge = "✓ verified" if p.get("verified") else "unverified"
+                stack = ", ".join(p.get("stack", []))
+                story.append(Paragraph(f"<b>{p.get('name','')}</b> — {badge}", body_style))
+                if stack:
+                    story.append(Paragraph(f"<i>{stack}</i>", small_style))
+                if p.get("blurb"):
+                    story.append(Paragraph(p["blurb"], body_style))
+                refs = []
+                if p.get("repo_url"): refs.append(f"repo: {p['repo_url']}")
+                if p.get("deploy_url"): refs.append(f"deploy: {p['deploy_url']}")
+                if refs:
+                    story.append(Paragraph(" · ".join(refs), small_style))
                 story.append(Spacer(1, 0.15*cm))
 
-        skill_tags = payload.get("skill_tags", {})
-        if skill_tags.get("verified"):
-            story += [
-                Paragraph("Verified Skills", section_style),
-                Paragraph(", ".join(skill_tags["verified"]), body_style),
-            ]
+        links = payload.get("links_verified") or []
+        if links:
+            story.append(Paragraph("Verified Links", section_style))
+            for l in links:
+                mark = "✓" if l.get("live") else "✗"
+                story.append(Paragraph(f"{mark} {l.get('url','')} ({l.get('kind','')}) — {l.get('note','')}", body_style))
+
+        flags = payload.get("red_flags") or []
+        if flags:
+            story.append(Paragraph("Red Flags", section_style))
+            for f in flags:
+                story.append(Paragraph(f"• {f}", body_style))
 
         doc.build(story)
         buf.seek(0)
-        filename = f"proof-ledger-{payload.get('user', submission_id)}.pdf"
+        slug = payload.get("github_username") or name.replace(" ", "-").lower()
+        filename = f"proof-of-build-{slug}.pdf"
         return StreamingResponse(buf, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     except ImportError:

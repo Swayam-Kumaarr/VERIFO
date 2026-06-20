@@ -29,7 +29,7 @@ function EyeIcon({ off }: { off?: boolean }) {
 }
 
 export default function LoginPage() {
-  const { user, loading, login, loginWithGitHub } = useAuth();
+  const { user, loading, login, loginWithGitHub, loginAsGuest } = useAuth();
   const router = useRouter();
 
   const [email, setEmail] = useState('');
@@ -37,6 +37,7 @@ export default function LoginPage() {
   const [showPass, setShowPass] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [githubLoading, setGithubLoading] = useState(false);
+  const [guestLoading, setGuestLoading] = useState(false);
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -54,6 +55,12 @@ export default function LoginPage() {
   const handleGitHub = () => {
     setGithubLoading(true);
     loginWithGitHub(); // redirects browser, loading state stays until redirect
+  };
+
+  const handleGuest = async () => {
+    setError(''); setGuestLoading(true);
+    try { await loginAsGuest(); }
+    catch (err) { setError(err instanceof Error ? err.message : 'guest sign-in failed'); setGuestLoading(false); }
   };
 
   return (
@@ -130,13 +137,25 @@ export default function LoginPage() {
           {/* GitHub button */}
           <button
             onClick={handleGitHub}
-            disabled={githubLoading || submitting}
+            disabled={githubLoading || submitting || guestLoading}
             className="w-full flex items-center justify-center gap-2.5 py-2.5 rounded-lg border border-[#2a2a35] bg-[#111118] text-white text-sm font-medium transition-all hover:border-[#6c63ff]/40 hover:bg-[#18181f] hover:-translate-y-px active:translate-y-0 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {githubLoading
               ? <span className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
               : <GitHubIcon />}
             {githubLoading ? 'Connecting...' : 'Continue with GitHub'}
+          </button>
+
+          {/* Guest button */}
+          <button
+            onClick={handleGuest}
+            disabled={githubLoading || submitting || guestLoading}
+            className="w-full flex items-center justify-center gap-2.5 py-2.5 rounded-lg border border-dashed border-[#2a2a35] bg-transparent text-[#a1a1aa] text-sm font-mono transition-all hover:border-[#6c63ff]/40 hover:text-white hover:-translate-y-px active:translate-y-0 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {guestLoading
+              ? <span className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+              : <span>👤</span>}
+            {guestLoading ? 'Creating guest...' : 'Continue as guest'}
           </button>
 
           {/* Divider */}
@@ -152,7 +171,7 @@ export default function LoginPage() {
               <label className="text-[10px] font-mono text-[#52525b] uppercase tracking-wider">Email</label>
               <div className="flex items-center gap-2 bg-[#0d0d14] border border-[#2a2a35] rounded-lg px-3 py-2.5 focus-within:border-[#6c63ff]/60 transition-all">
                 <input
-                  type="email" value={email}
+                  type="text" value={email}
                   onChange={e => { setEmail(e.target.value); setError(''); }}
                   placeholder="you@example.com" autoComplete="email"
                   className="flex-1 bg-transparent text-sm text-white font-mono placeholder:text-[#3f3f46] focus:outline-none"

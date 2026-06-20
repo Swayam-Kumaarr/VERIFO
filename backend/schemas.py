@@ -52,7 +52,7 @@ class AnalysisStatusOut(BaseModel):
     status: str
     current_step: int
     step_label: str | None
-    step_logs: dict[str, list[str]]
+    step_logs: list[str]
     error: str | None
     started_at: datetime | None
     finished_at: datetime | None

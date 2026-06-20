@@ -162,7 +162,7 @@ export default function SignupPage() {
               <label className="text-[10px] font-mono text-[#52525b] uppercase tracking-wider">Email</label>
               <div className="flex items-center gap-2 bg-[#0d0d14] border border-[#2a2a35] rounded-lg px-3 py-2.5 focus-within:border-[#6c63ff]/60 transition-all">
                 <input
-                  type="email" value={email} onChange={e => setEmail(e.target.value)}
+                  type="text" value={email} onChange={e => setEmail(e.target.value)}
                   placeholder="you@example.com" autoComplete="email"
                   className="flex-1 bg-transparent text-sm text-white font-mono placeholder:text-[#3f3f46] focus:outline-none"
                 />

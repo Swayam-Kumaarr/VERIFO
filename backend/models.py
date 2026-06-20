@@ -59,9 +59,9 @@ class AnalysisRun(Base):
     id = Column(String, primary_key=True)
     submission_id = Column(String, ForeignKey("submissions.id"), nullable=False)
     status = Column(String, default="pending")  # pending | running | done | failed
-    current_step = Column(Integer, default=0)   # 0-5
-    step_label = Column(String, nullable=True)
-    _step_logs = Column("step_logs", Text, default="{}")
+    current_step = Column(Integer, default=0)   # tool calls made so far
+    step_label = Column(String, nullable=True)  # what the agent is doing right now
+    _step_logs = Column("step_logs", Text, default="[]")
     error = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -69,11 +69,11 @@ class AnalysisRun(Base):
 
     @property
     def step_logs(self):
-        return json.loads(self._step_logs or "{}")
+        return json.loads(self._step_logs or "[]")
 
     @step_logs.setter
     def step_logs(self, value):
-        self._step_logs = json.dumps(value or {})
+        self._step_logs = json.dumps(value or [])
 
 
 class Result(Base):

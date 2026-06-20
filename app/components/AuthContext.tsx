@@ -31,6 +31,7 @@ interface AuthCtx {
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
   signup: (name: string, email: string, password: string, role: 'developer' | 'client') => Promise<void>;
+  loginAsGuest: () => Promise<void>;
   loginWithGitHub: () => void;
   connectGitHub: (payload: GitHubPayload) => Promise<void>;
   disconnectGitHub: () => Promise<void>;
@@ -110,6 +111,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     router.push('/dashboard');
   };
 
+  const loginAsGuest = async () => {
+    const data = await apiFetch('/api/auth/guest', { method: 'POST' });
+    setUser(mapUser(data.user));
+    router.push('/dashboard');
+  };
+
   // Opens GitHub OAuth in a small popup — main page never navigates away
   const loginWithGitHub = () => {
     const w = 600, h = 700;
@@ -178,7 +185,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <Ctx.Provider value={{ user, loading, login, signup, loginWithGitHub, connectGitHub, disconnectGitHub, logout, refreshUser }}>
+    <Ctx.Provider value={{ user, loading, login, signup, loginAsGuest, loginWithGitHub, connectGitHub, disconnectGitHub, logout, refreshUser }}>
       {children}
     </Ctx.Provider>
   );

@@ -9,26 +9,20 @@ router = APIRouter(prefix="/api/portfolio", tags=["portfolio"])
 
 
 def _build_badges(payload: dict) -> list[dict]:
-    badges = []
-    skill_tags = payload.get("skill_tags", {})
-    flags = payload.get("flags", {})
+    badges: list[dict] = []
+    for s in payload.get("skills") or []:
+        badges.append({"category": "skill", "label": s.get("name", ""), "verified": True, "flagged": False})
 
-    for lang in skill_tags.get("languages", []):
-        badges.append({"category": "language", "label": lang, "verified": True, "flagged": False})
-    for fw in skill_tags.get("frameworks", []):
-        badges.append({"category": "framework", "label": fw, "verified": True, "flagged": False})
-    for skill in skill_tags.get("verified", []):
-        badges.append({"category": "skill", "label": skill, "verified": True, "flagged": False})
-    for ai in (skill_tags.get("flagged_ai_assisted") or []):
-        if ai:
-            badges.append({"category": "ai-assisted", "label": ai, "verified": False, "flagged": True})
+    live_count = sum(1 for l in (payload.get("links_verified") or []) if l.get("live"))
+    if live_count:
+        badges.append({"category": "deployment", "label": f"{live_count} live link(s)", "verified": True, "flagged": False})
 
-    if flags.get("deployments_live", 0) > 0:
-        badges.append({"category": "deployment", "label": f"{flags['deployments_live']} live deployment(s) verified", "verified": True, "flagged": False})
-    if flags.get("consistent_commit_cadence"):
-        badges.append({"category": "pattern", "label": "Consistent commit cadence", "verified": True, "flagged": False})
-    if flags.get("no_copy_paste_spikes"):
-        badges.append({"category": "pattern", "label": "No copy-paste spikes", "verified": True, "flagged": False})
+    for p in payload.get("projects") or []:
+        if p.get("verified"):
+            badges.append({"category": "project", "label": p.get("name", ""), "verified": True, "flagged": False})
+
+    for f in payload.get("red_flags") or []:
+        badges.append({"category": "flag", "label": f, "verified": False, "flagged": True})
 
     return badges
 
@@ -47,9 +41,9 @@ def get_portfolio(submission_id: str, db: Session = Depends(get_db)):
     payload = result.payload
     return {
         "submission_id": submission_id,
-        "user": payload.get("user", ""),
+        "user": payload.get("github_username") or payload.get("name", ""),
         "verified_at": payload.get("verified_at", ""),
-        "authenticity_score": payload.get("authenticity_score", 0),
+        "authenticity_score": max(0, 100 - 10 * len(payload.get("red_flags") or [])),
         "repositories": payload.get("projects", []),
         "badges": _build_badges(payload),
     }

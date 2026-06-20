@@ -5,7 +5,7 @@ from datetime import datetime
 import httpx
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, Response, Cookie, status
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -32,13 +32,13 @@ def _set_tokens(response: Response, user_id: str):
 
 class RegisterBody(BaseModel):
     name: str
-    email: EmailStr
+    email: str
     password: str
     role: str = "developer"
 
 
 class LoginBody(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
 
@@ -107,6 +107,24 @@ def logout(response: Response):
     return {"ok": True}
 
 
+@router.post("/guest")
+def guest(response: Response, db: Session = Depends(get_db)):
+    """Create a throwaway guest account and sign in. No password, no email verification."""
+    suffix = uuid.uuid4().hex[:8]
+    user = User(
+        id=str(uuid.uuid4()),
+        email=f"guest-{suffix}@nexora.local",
+        name=f"Guest {suffix[:4]}",
+        role="developer",
+        created_at=datetime.utcnow(),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    _set_tokens(response, user.id)
+    return {"user": _user_dict(user)}
+
+
 @router.post("/refresh")
 def refresh(response: Response, refresh_token: str | None = Cookie(default=None), db: Session = Depends(get_db)):
     if not refresh_token:
@@ -128,7 +146,7 @@ def me(current_user: User = Depends(get_current_user)):
 
 class UpdateProfileBody(BaseModel):
     name: str | None = None
-    email: EmailStr | None = None
+    email: str | None = None
 
 
 @router.patch("/me")
